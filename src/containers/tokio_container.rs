@@ -8,8 +8,8 @@ use futures::future::BoxFuture;
 use tokio::runtime::Runtime;
 use tokio::time;
 use tokio::time::{Interval, interval_at};
-use crate::v1::common::{AsyncFn, SyncFn};
-use crate::v1::containers::Container;
+use crate::common::{AsyncFn, SyncFn};
+use crate::containers::Container;
 
 impl Container for Runtime {
     fn schedule_async(&self, executable: Arc<AsyncFn>) {

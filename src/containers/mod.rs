@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::tasks::Task;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use crate::v1::common::{AsyncFn, SyncFn};
+use crate::common::{AsyncFn, SyncFn};
 
 mod tokio_container;
 
