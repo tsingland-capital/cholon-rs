@@ -1,188 +1,131 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::time::{Duration, Instant};
+use futures::future::BoxFuture;
 use uuid::Uuid;
-use crate::utils::truncate;
-use crate::delay_queues::DelayQueue;
-use crate::errors::Error;
-use crate::tasks::Task;
+use crate::containers::Container;
+use crate::routines::{Cron, Routine, Timeout};
+use crate::tasks::{Executable, Task};
+use crate::common::{TimeSource, SyncFn, AsyncFn};
 use crate::timing_wheels::TimingWheel;
-use crate::traits::{Cron, Timeout, TimeSource, SystemTimeSource, Once, Scheduled};
+use crate::delay_queues::DelayQueue;
+use crate::utils::truncate;
+use futures::prelude::*;
 
-pub struct SchedulerBuilder {
-    time_source: Option<Arc<dyn TimeSource>>,
-    thread_pool: Option<Arc<ThreadPool>>,
-    tick: i64,
-    size: usize,
-}
-
-impl SchedulerBuilder {
-    pub fn new() -> Self{
-        Self{
-            time_source: None,
-            thread_pool: None,
-            tick: 1000,
-            size: 100,
-        }
-    }
-}
-
-impl SchedulerBuilder {
-    pub fn with_time_source<T>(mut self, time_source: T) -> Self where T: 'static + TimeSource{
-        self.time_source = Some(Arc::new(time_source));
-        self
-    }
-    pub fn with_thread_pool(mut self, thread_pool: Arc<ThreadPool>) -> Self{
-        self.thread_pool = Some(thread_pool);
-        self
-    }
-    pub fn with_tick(mut self, tick: i64) -> Self{
-        self.tick = tick;
-        self
-    }
-    pub fn with_size(mut self, size: usize) -> Self{
-        self.size = size;
-        self
-    }
-}
-
-impl Default for SchedulerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SchedulerBuilder{
-    pub fn build(self) -> Result<Scheduler, Error> {
-        if self.size <= 1 {
-            return Err(Error::InvalidParam("timing wheel size must be greater than 1"));
-        }
-        if self.tick <= 1 {
-            return Err(Error::InvalidParam("timing wheel tick must be greater than 1"));
-        }
-        let time_source = match self.time_source {
-            Some(time_source) => time_source,
-            None => Arc::new(SystemTimeSource::new()),
-        };
-
-
-        let queue = DelayQueue::new();
-        let now = time_source.now();
-        Ok(Scheduler{
-            inner: Arc::new(SchedulerInner {
-                quit: AtomicBool::new(false),
-                tick_ms: self.tick,
-                timing_wheel: TimingWheel::new(self.tick, self.size as i64, now, queue.clone()),
-                queue,
-                time_source,
-                thread_pool: match self.thread_pool {
-                    Some(thread_pool) => thread_pool,
-                    None => Arc::new(ThreadPoolBuilder::new().
-                        num_threads(4).
-                        thread_name(|idx| format!("cholon_task_pool_{}", idx)).
-                        build().
-                        unwrap()),
-                },
-
-            })
-        })
-    }
-}
-
-struct SchedulerInner {
+pub struct SchedulerInner<Ctr, TS> where Ctr: Container, TS: TimeSource{
     quit: AtomicBool,
+    container: Arc<Ctr>,
+    time_source: Arc<TS>,
+    queue: DelayQueue,
     tick_ms: i64,
     timing_wheel: TimingWheel,
-    queue: DelayQueue,
-    time_source: Arc<dyn TimeSource>,
-    thread_pool: Arc<ThreadPool>,
 }
 
-pub struct Scheduler {
-    inner: Arc<SchedulerInner>,
+impl<Ctr, TS>  SchedulerInner<Ctr, TS> where Ctr: Container, TS: TimeSource  {
+    pub fn heartbeat(&self) {
+        if self.quit.load(Ordering::Relaxed){
+            return;
+        }
+        let now = truncate(self.time_source.now(), self.tick_ms);
+        self.timing_wheel.advance_clock(now);
+        if let Some(bucket) = self.queue.peek_and_shift(now){
+            // println!("调度器执行检查, {}", now);
+            for mut task in bucket.get_tasks() {
+                match &task.executable {
+                    Executable::Future(async_fn) => {
+                        self.container.schedule_async(async_fn.clone())
+                    }
+                    Executable::Block(sync_fn) => {
+                        self.container.schedule_block(sync_fn.clone())
+                    }
+                }
+                if task.update(){
+                    println!("重新插入任务, {}", task.expiration);
+                    self.timing_wheel.schedule(task);
+                }
+            }
+        }
+    }
+}
+pub struct Scheduler<Ctr, TS> where Ctr: Container, TS: TimeSource {
+    inner: Arc<SchedulerInner<Ctr, TS>>,
 }
 
-impl Scheduler {
-    pub fn new<T>(
-        tick_ms: i64, wheel_size: i64, time_source: T, thread_pool: Arc<ThreadPool>,
-    ) -> Self where T: TimeSource {
+impl<Ctr, TS>  Scheduler<Ctr, TS> where Ctr: Container, TS: TimeSource {
+    pub fn new(
+        tick_ms: i64, wheel_size: i64, time_source: TS, container: Ctr,
+    ) -> Self {
         let queue = DelayQueue::new();
         let now = time_source.now();
-        Self{
+        Self {
             inner: Arc::new(SchedulerInner {
                 quit: AtomicBool::new(false),
+                container: Arc::new(container),
                 tick_ms,
                 timing_wheel: TimingWheel::new(tick_ms, wheel_size, now, queue.clone()),
-                queue,
                 time_source: Arc::new(time_source),
-                thread_pool,
+                queue
             })
         }
     }
 
-    pub fn schedule(&self, task: Task) -> bool {
-        self.inner.timing_wheel.schedule(task)
+    pub fn schedule(&self, executable: Executable, routine: Arc<dyn Routine>) -> bool {
+        if let Some(expiration) = routine.next() {
+            let task = Task {
+                id: Uuid::new_v4(),
+                expiration,
+                executable,
+                routine,
+            };
+            self.inner.timing_wheel.schedule(task)
+        } else {
+            false
+        }
     }
 
-    pub fn schedule_once<F>(&self, timeout: i64, f: F) -> bool where F: Fn() + Sync + Send + 'static {
+    pub fn schedule_block_cron<F>(&self, expression: &str, f: F) -> bool where F: Fn() -> () + Send + Sync + 'static {
         let now = self.inner.time_source.now();
-        let task = Task{
-            id: Uuid::new_v4(),
-            expiration: now + timeout,
-            handler: Arc::new(f),
-            scheduled: Arc::new(Once::new())
-        };
-        self.inner.timing_wheel.schedule(task)
+        let cron_schedule = Cron::new(now, expression, None);
+        self.schedule(Executable::Block(Arc::new(f)), Arc::new(cron_schedule))
     }
 
-    pub fn schedule_cron<F>(&self, expression: &str, f: F) -> bool where F: Fn() + Sync + Send + 'static {
+    pub fn schedule_async_cron<F>(&self, expression: &str, f: F) -> bool where F: Fn() -> (BoxFuture<'static, ()>) + Send + Sync + 'static {
         let now = self.inner.time_source.now();
-        let cron_schedule = Cron::new(now, expression);
-        let task = Task{
-            id: Uuid::new_v4(),
-            expiration: cron_schedule.next().unwrap(),
-            handler: Arc::new(f),
-            scheduled: Arc::new(cron_schedule),
-        };
-        self.inner.timing_wheel.schedule(task)
+        let cron_schedule = Cron::new(now, expression, None);
+        self.schedule(Executable::Future(Arc::new(f)), Arc::new(cron_schedule))
     }
 
-    pub fn schedule_timeout<F>(&self, timeout: i64, f: F) -> bool where F: Fn() + Sync + Send + 'static {
+    pub fn schedule_block_timeout<F>(&self, timeout: i64, f: F) -> bool where F: Fn() -> () + Send + Sync + 'static {
         let now = self.inner.time_source.now();
-        let timeout = Timeout::new(now, timeout);
-        let task = Task{
-            id: Uuid::new_v4(),
-            expiration: timeout.next().unwrap(),
-            handler: Arc::new(f),
-            scheduled: Arc::new(timeout)
-        };
-        self.inner.timing_wheel.schedule(task)
+        let timeout = Timeout::new(now, timeout, None);
+        self.schedule(Executable::Block(Arc::new(f)), Arc::new(timeout))
     }
 
+    pub fn schedule_async_timeout<F>(&self, timeout: i64, f: F) -> bool where F: Fn() -> (BoxFuture<'static, ()>) + Send + Sync + 'static {
+        let now = self.inner.time_source.now();
+        let timeout = Timeout::new(now, timeout, None);
+        self.schedule(Executable::Future(Arc::new(f)), Arc::new(timeout))
+    }
     pub fn start(&self) {
+
         let scheduler = self.inner.clone();
-        self.inner.thread_pool.spawn(move ||{
-            loop {
-                if scheduler.quit.load(Ordering::Relaxed){
-                    return;
-                }
-                let now = truncate(scheduler.time_source.now(), scheduler.tick_ms);
-                if let Some(bucket) = scheduler.queue.peek_and_shift(now){
-                    for mut task in bucket.get_tasks() {
-                        let handler = task.handler.clone();
-                        scheduler.thread_pool.spawn(move || {
-                            (handler)()
-                        });
-                        if task.update(){
-                            scheduler.timing_wheel.schedule(task);
-                        }
-                    }
-                }
+        self.inner.container.run_forever(
+            Instant::now(),
+            Duration::from_secs(1),
+            Arc::new(move || {
+                let scheduler = scheduler.clone();
+                async move {
+                    scheduler.heartbeat();
+                }.boxed()
             }
-        })
+        ));
     }
 
     pub fn stop(&self) {
         self.inner.quit.store(true, Ordering::Relaxed)
+    }
+
+    pub fn heartbeat(&self) {
+        self.inner.heartbeat()
     }
 }
