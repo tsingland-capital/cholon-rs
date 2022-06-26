@@ -12,16 +12,16 @@ use crate::delay_queues::DelayQueue;
 use crate::utils::truncate;
 use futures::prelude::*;
 
-pub struct SchedulerInner<Ctr, TS> where Ctr: Container, TS: TimeSource{
+pub struct SchedulerInner {
     quit: AtomicBool,
-    container: Arc<Ctr>,
-    time_source: Arc<TS>,
+    container: Arc<dyn Container>,
+    time_source: Arc<dyn TimeSource>,
     queue: DelayQueue,
     tick_ms: i64,
     timing_wheel: TimingWheel,
 }
 
-impl<Ctr, TS>  SchedulerInner<Ctr, TS> where Ctr: Container, TS: TimeSource  {
+impl SchedulerInner {
     pub fn heartbeat(&self) {
         if self.quit.load(Ordering::Relaxed){
             return;
@@ -47,14 +47,14 @@ impl<Ctr, TS>  SchedulerInner<Ctr, TS> where Ctr: Container, TS: TimeSource  {
         }
     }
 }
-pub struct Scheduler<Ctr, TS> where Ctr: Container, TS: TimeSource {
-    inner: Arc<SchedulerInner<Ctr, TS>>,
+pub struct Scheduler {
+    inner: Arc<SchedulerInner>,
 }
 
-impl<Ctr, TS>  Scheduler<Ctr, TS> where Ctr: Container, TS: TimeSource {
-    pub fn new(
+impl Scheduler{
+    pub fn new<Ctr, TS>(
         tick_ms: i64, wheel_size: i64, time_source: TS, container: Ctr,
-    ) -> Self {
+    ) -> Self where Ctr: Container, TS: TimeSource {
         let queue = DelayQueue::new();
         let now = time_source.now();
         Self {
