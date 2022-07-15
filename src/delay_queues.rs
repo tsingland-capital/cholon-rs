@@ -51,8 +51,6 @@ impl DelayQueue {
         }
         buckets
     }
-
-
 }
 
 impl Clone for DelayQueue {
