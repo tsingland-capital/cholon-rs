@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use chrono::{TimeZone, Local};
+use log::{info, trace};
 use crate::tasks::Task;
 
 pub struct BucketInner {
@@ -64,6 +66,7 @@ impl Bucket {
     pub fn add(&self, task: Task) {
         let mut tasks = self.inner.tasks.lock().unwrap();
         tasks.push(task);
+        trace!("当前Bucket包含的任务个数{}, 过期时间: {}", tasks.len(), Local.timestamp_millis(self.get_expiration()).format("%Y-%m-%d %H:%M:%S"));
     }
 
     pub fn get_tasks(&self) -> Vec<Task> {

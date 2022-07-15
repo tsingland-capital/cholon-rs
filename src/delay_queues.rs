@@ -1,9 +1,11 @@
 use std::collections::{BinaryHeap, BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use chrono::{Local, TimeZone};
+use log::{info, trace};
 use crate::buckets::Bucket;
 
 pub struct DelayQueueInner {
-    priority_queue: BTreeSet<Bucket>,
+    queue: Vec<Bucket>,
 }
 
 pub struct DelayQueue {
@@ -16,7 +18,7 @@ impl DelayQueue {
             inner: Arc::new(
                 Mutex::new(
                     DelayQueueInner {
-                        priority_queue: BTreeSet::new()
+                        queue: vec![],
                     }
                 )
             )
@@ -25,40 +27,29 @@ impl DelayQueue {
 
     pub fn push(&self, bucket: Bucket) {
         let mut queue = self.inner.lock().unwrap();
-        queue.priority_queue.insert(bucket);
+        queue.queue.push(bucket);
+        queue.queue.sort();
     }
 
-    pub fn peek_and_shift(&self, expiration: i64) -> Option<Bucket> {
-
-        // let mut expired_buckets = vec![];
-
-        // {
-        //     let queue = self.inner.lock().unwrap();
-        //     for bucket in queue.priority_queue {
-        //         if bucket.get_expiration() <= expiration{
-        //             expired_buckets.push(bucket);
-        //         }
-        //     }
-        //     if let Some(bucket) = queue.priority_queue.iter().next(){
-        //         Some(bucket.clone())
-        //     } else { None }
-        // }
-        if let Some(bucket) = {
-            let queue = self.inner.lock().unwrap();
-            if let Some(bucket) = queue.priority_queue.iter().next(){
-                Some(bucket.clone())
-            } else { None }
-        } {
+    pub fn peek_and_shift(&self, expiration: i64) -> Vec<Bucket> {
+        let mut buckets = vec![];
+        let mut max_count = 0;
+        let mut queue = self.inner.lock().unwrap();
+        for idx in 0..queue.queue.len() {
+            let bucket = queue.queue.get(idx).unwrap();
             if bucket.get_expiration() <= expiration {
-                {
-                    let mut queue = self.inner.lock().unwrap();
-                    queue.priority_queue.remove(&bucket);
-                }
-                Some(bucket)
+                trace!("检查到过期Bucket: {}", Local.timestamp_millis(bucket.get_expiration()).format("%Y-%m-%d %H:%M:%S"));
+                buckets.push(bucket.clone());
+                max_count += 1;
             } else {
-                None
+                break
             }
-        } else { None }
+        };
+        // 移除开头过期元素
+        for idx in 0..max_count{
+            queue.queue.remove(0);
+        }
+        buckets
     }
 
 

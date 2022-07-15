@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use chrono::{Local, TimeZone};
+use crossbeam::sync::WaitGroup;
 use futures::future::BoxFuture;
 use uuid::Uuid;
 use crate::containers::Container;
@@ -11,6 +13,7 @@ use crate::timing_wheels::TimingWheel;
 use crate::delay_queues::DelayQueue;
 use crate::utils::truncate;
 use futures::prelude::*;
+use log::{info, trace};
 
 pub struct SchedulerInner {
     quit: AtomicBool,
@@ -22,48 +25,73 @@ pub struct SchedulerInner {
 }
 
 impl SchedulerInner {
-    pub fn heartbeat(&self) {
+    pub fn heartbeat(&self, block: bool) {
         if self.quit.load(Ordering::Relaxed){
             return;
         }
         let now = truncate(self.time_source.now(), self.tick_ms);
         self.timing_wheel.advance_clock(now);
-        if let Some(bucket) = self.queue.peek_and_shift(now){
-            // println!("调度器执行检查, {}", now);
-            for mut task in bucket.get_tasks() {
-                match &task.executable {
-                    Executable::Future(async_fn) => {
-                        self.container.schedule_async(async_fn.clone())
+        if block {
+            for bucket in self.queue.peek_and_shift(now){
+                let wg = WaitGroup::new();
+                trace!("调度器获取到过期Bucket, 过期时间: {}", Local.timestamp_millis(bucket.get_expiration()).format("%Y-%m-%d %H:%M:%S"));
+                for mut task in bucket.get_tasks() {
+                    trace!("准备执行计划任务: {}", task.id);
+                    match &task.executable {
+                        Executable::Future(async_fn) => {
+                            self.container.schedule_async(async_fn.clone(), Some(wg.clone()));
+                        }
+                        Executable::Block(sync_fn) => {
+                            self.container.schedule_block(sync_fn.clone(), Some(wg.clone()));
+                        }
                     }
-                    Executable::Block(sync_fn) => {
-                        self.container.schedule_block(sync_fn.clone())
+                    if task.update(){
+                        // println!("重新插入任务, {}", task.expiration);
+                        self.timing_wheel.schedule(task);
                     }
                 }
-                if task.update(){
-                    println!("重新插入任务, {}", task.expiration);
-                    self.timing_wheel.schedule(task);
+                wg.wait();
+            }
+        } else {
+            for bucket in self.queue.peek_and_shift(now){
+                // println!("调度器执行检查, {}", now);
+                for mut task in bucket.get_tasks() {
+                    match &task.executable {
+                        Executable::Future(async_fn) => {
+                            self.container.schedule_async(async_fn.clone(), None);
+                        }
+                        Executable::Block(sync_fn) => {
+                            self.container.schedule_block(sync_fn.clone(), None);
+                        }
+                    }
+                    if task.update(){
+                        // println!("重新插入任务, {}", task.expiration);
+                        self.timing_wheel.schedule(task);
+                    }
                 }
             }
         }
     }
 }
+
 pub struct Scheduler {
     inner: Arc<SchedulerInner>,
 }
 
 impl Scheduler{
-    pub fn new<Ctr, TS>(
-        tick_ms: i64, wheel_size: i64, time_source: TS, container: Ctr,
-    ) -> Self where Ctr: Container, TS: TimeSource {
+    // tick_ms尽量为1000ms的约数，wheel_size越大越准确，但要为60的倍数，不然会存在累计差
+    pub fn new(
+        tick_ms: i64, wheel_size: i64, time_source: Arc<dyn TimeSource>, container: Arc<dyn Container>,
+    ) -> Self {
         let queue = DelayQueue::new();
         let now = time_source.now();
         Self {
             inner: Arc::new(SchedulerInner {
                 quit: AtomicBool::new(false),
-                container: Arc::new(container),
+                container,
                 tick_ms,
                 timing_wheel: TimingWheel::new(tick_ms, wheel_size, now, queue.clone()),
-                time_source: Arc::new(time_source),
+                time_source,
                 queue
             })
         }
@@ -106,6 +134,7 @@ impl Scheduler{
         let timeout = Timeout::new(now, timeout, None);
         self.schedule(Executable::Future(Arc::new(f)), Arc::new(timeout))
     }
+
     pub fn start(&self) {
 
         let scheduler = self.inner.clone();
@@ -115,7 +144,7 @@ impl Scheduler{
             Arc::new(move || {
                 let scheduler = scheduler.clone();
                 async move {
-                    scheduler.heartbeat();
+                    scheduler.heartbeat(false);
                 }.boxed()
             }
         ));
@@ -125,7 +154,7 @@ impl Scheduler{
         self.inner.quit.store(true, Ordering::Relaxed)
     }
 
-    pub fn heartbeat(&self) {
-        self.inner.heartbeat()
+    pub fn heartbeat(&self, block: bool) {
+        self.inner.heartbeat(block)
     }
 }
